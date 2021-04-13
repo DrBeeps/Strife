@@ -75,8 +75,7 @@ double angleYOut, angleZOut;
 // ====================
 FlightState currentState;
 
-const uint8_t launchDetect = 12;
-const int8_t burnoutDetect = -11;
+const uint8_t launchDetect = 11;
 
 const uint64_t launchDetectTime = 100000;
 
@@ -197,7 +196,7 @@ void calGyros()
 
 void checkLaunch()
 {
-  if(imuRawData.accelX < launchDetect) launchDetectStart = thisLoopMicros;
+  if(imuRawData.accelX > launchDetect) launchDetectStart = thisLoopMicros;
   if(thisLoopMicros > launchDetectStart + launchDetectTime) currentState = POWERED_FLIGHT;
   Serial.print("Accel X "); Serial.print(imuRawData.accelX); Serial.print("\t");
 }
