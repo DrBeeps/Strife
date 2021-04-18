@@ -3,17 +3,24 @@
 #include <BMI088.h>
 #include <SD.h>
 #include <Servo.h>
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
 
 #include <Orientation.h>
 #include <PID.h>
 
 #include <DataPoint.h>
 #include <FlightState.h>
+#include <FIRFilter.h>
 
 
 
 Bmi088Accel accel(Wire,0x19);
 Bmi088Gyro gyro(Wire,0x69);
+
+Adafruit_BMP280 bmp;
+
+int status;
 
 Servo tvcZ;
 Servo tvcY;
@@ -26,9 +33,9 @@ const int statusled = 13;
 
 FlightState currentState;
 
-
 const int LAUNCH_CHECK = 15;
 
+FIRFilter baroFIR;
 
 Orientation ori;
 EulerAngles gyroData;
@@ -44,6 +51,7 @@ double elapsedFlightTime;
 
 uint64_t thisLoopMicros = 0;
 uint64_t lastMainLoopMicros = 0;
+uint64_t checkStartTimeMicros = 0;
 uint64_t logDtMicros = 0;
 double dt = 0;
 
@@ -66,17 +74,25 @@ int homeYAngle = 90;
 int homeZAngle = 90;
 int SGR = 6;
 
-double kp = 0.3;
-double ki = 0.25;
-double kd = 0.1;
+double kp = 0.24;
+double ki = 0.05;
+double kd = 0.07;
 double setpoint = 0;
 PID pidY = {kp, ki, kd, setpoint};
 PID pidZ = {kp, ki, kd, setpoint};
+
+float force;
+int radius = 37;
 
 File logFile;
 uint8_t logFileNumber;
 int failure;
 // bool abort;
+
+float aproxAlt;
+float aproxFilteredAlt;
+float maxAlt = 0;
+float curAlt;
 
 double flightAlt;
 double fcBatt;
@@ -135,12 +151,10 @@ void getGyroBias()
 
 void startup()
 {
-    int status;
-
     Serial.begin(115200);
-
     delay(1000);
 
+    /* ===== BMI088 INIT ===== */
     status = accel.begin();
     if (status < 0) 
     {
@@ -156,6 +170,22 @@ void startup()
         Serial.println(status);
         while (1) {}
     }
+
+    /* ===== BARO INIT ===== */
+
+    if (!bmp.begin())
+    {
+        Serial.println("BMP280 Initialization Error");
+        while (1) {}
+    }
+
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
+                  Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
+                  Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
+                  Adafruit_BMP280::FILTER_X16,      /* Filtering. */
+                  Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+
+    baroFIR.FIRFilter_Init();
 }
 
 void setupPins()
@@ -179,15 +209,15 @@ void startTiming()
 
 void setupSD()
 {
-  Serial.print("Initializing SD card...");
+  // Serial.print("Initializing SD card...");
 
   if (!SD.begin(BUILTIN_SDCARD)) 
   {
-    Serial.println("Card failed, or not present");
+    // Serial.println("Card failed, or not present");
     return;
   }
 
-  Serial.println("card initialized.");
+  // Serial.println("card initialized.");
 }
 
 void logTest()
@@ -230,7 +260,7 @@ void makeLogFile()
 {
     if (!SD.begin(BUILTIN_SDCARD))
     {
-        Serial.println("Failed to create log file");
+        // Serial.println("Failed to create log file");
         failure |= SD_INIT_TIMEOUT;
         return;
     }
@@ -240,7 +270,6 @@ void makeLogFile()
         for (int i = 0; i < 256; i++)
         {
             sprintf(logFileName, "log%.3u.csv", i);
-            Serial.println("Created log file");
             if (!SD.exists(logFileName))
             {
                 logFile = SD.open(logFileName, FILE_WRITE);
@@ -254,10 +283,8 @@ void makeLogFile()
 
 void logData()
 {
-   //  Serial.println("Running log data function");
     if (logFile && thisLoopMicros > lastLogUpdate + logMicros)
     {
-        // Serial.println("Logging attempt!");
         char line[350] = "";
         logDtMicros = thisLoopMicros - lastLogUpdate;
         sprintf(line, "%15f,%d,%15f,%15f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%15f,%15f,%15f,%15f,%15f,%15f,%15f,%15f,%15f,%15f,%15f,%15f,%15f,%u,%u",
@@ -291,7 +318,6 @@ void logData()
             pyro4Val);
         logFile.println(line);
         logFile.flush();
-        // Serial.println("Data logging successful");
 
         lastLogUpdate = thisLoopMicros;
     }
@@ -304,7 +330,12 @@ void updateTiming()
     lastMainLoopMicros = thisLoopMicros;
 }
 
-void checkSensors()
+void checkBaro()
+{
+    curAlt = baroFIR.FIRFilter_Update(bmp.readAltitude(1022));
+}
+
+void checkIMU()
 {
     gyro.readSensor();
     accel.readSensor();
@@ -319,18 +350,13 @@ void checkSensors()
 
     temp = accel.getTemperature_C();
 
+    force = accelData.x - 9.81;
+
     ori.update(gyroData, dt);
     gyroOut = ori.toEuler();
 
     gyroOut.pitch = gyroOut.pitch; // sign flip because for some reason pitch and yaw are left hand rule naturally
     gyroOut.yaw = -gyroOut.yaw;
-}
-
-void printOri()
-{
-    Serial.print("X "); Serial.print(gyroOut.roll * RAD_TO_DEG); Serial.print("\t");
-    Serial.print("Y "); Serial.print(gyroOut.pitch * RAD_TO_DEG); Serial.print("\t");
-    Serial.print("Z "); Serial.print(gyroOut.yaw * RAD_TO_DEG); Serial.print("\n");
 }
 
 void updatePID()
@@ -362,7 +388,7 @@ void updatePID()
 void checkLaunch()
 {
   if(imuRawData.accelX > launchDetect) launchDetectStart = thisLoopMicros;
-  if(thisLoopMicros > launchDetectStart + launchDetectTime) currentState = POWERED_FLIGHT;
+  if(thisLoopMicros > launchDetectStart + launchDetectTime) currentState = FLIGHT;
   Serial.print("Accel X "); Serial.print(imuRawData.accelX); Serial.print("\t");
 }
 */
@@ -371,18 +397,22 @@ void checkLaunch()
 {
     if(accelData.x > LAUNCH_CHECK)
     {
-        currentState = POWERED_FLIGHT;
+        currentState = FLIGHT;
     }
 }
 
-void checkBurnout()
+void checkBurnout() 
 {
 
 }
 
 void checkApogee()
 {
-
+    maxAlt = max(maxAlt, curAlt);
+    if (curAlt > maxAlt - 0.5)
+        checkStartTimeMicros = thisLoopMicros;
+    if (thisLoopMicros > (checkStartTimeMicros + 0.5))
+        currentState = BALLISTIC_DESCENT;
 }
 
 void checkChuteStop()
@@ -436,53 +466,48 @@ void setup()
 void loop() 
 {
     updateTiming();
-    Serial.print("TIME: "); Serial.print((double)thisLoopMicros / 1000000.); Serial.print("\t");
-    checkSensors();
 
-    Serial.print("ACCELX: "); Serial.print(accelData.x); Serial.print("\t");
+    Serial.print("TIME: "); Serial.print((double)thisLoopMicros / 1000000.); Serial.print("\t");
+
+    checkIMU();
+    checkBaro();
+
     Serial.print("PITCH: "); Serial.print(gyroOut.pitch * RAD_TO_DEG); Serial.print("\t");
     Serial.print("YAW: ");Serial.print(gyroOut.yaw * RAD_TO_DEG); Serial.print("\t");
     Serial.print("PIDY: "); Serial.print(angleYOut); Serial.print("\t");
-    Serial.print("PIDZ: ");Serial.print(angleZOut); Serial.print("\n");
-
+    Serial.print("PIDZ: ");Serial.print(angleZOut); Serial.print("\t");
+    Serial.print("curAlt: "); Serial.print(curAlt); Serial.print("\t");
+    Serial.print("maxAlt: "); Serial.print(maxAlt); Serial.print("\n");
+    
     switch(currentState)
     {
         case GROUND_IDLE:
             checkLaunch();
             break;
-
-        case POWERED_FLIGHT:
+        case FLIGHT:
             updatePID();
-            checkBurnout();
-            break;
-
-        case UNPOWERED_FLIGHT:
             checkApogee();
             break;
-
         case BALLISTIC_DESCENT:
+            Serial.print("IT WORKED!!!!!!!!!!!!!!!!!!!!!!!!!!");
             checkChuteStop();
             break;
-
         case CHUTE_DESCENT:
             checkLanded();
             break;
-
         case GROUND_SAFE:
             showSafe();
             break;
-
         case ABORT:
             abortFlight();
             break;
-
         case STATIC_ABORT:
             abortFlight();
             break;
-        
         case STATIC_FIRE:
             break;
     }
+    
 
     logData();
 }
