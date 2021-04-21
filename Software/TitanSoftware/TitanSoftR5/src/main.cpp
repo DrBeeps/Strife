@@ -33,7 +33,7 @@ const int statusled = 13;
 
 FlightState currentState;
 
-const int LAUNCH_CHECK = 15;
+const int LAUNCH_CHECK = 20;
 
 FIRFilter baroFIR;
 
@@ -52,6 +52,8 @@ double elapsedFlightTime;
 uint64_t thisLoopMicros = 0;
 uint64_t lastMainLoopMicros = 0;
 uint64_t checkStartTimeMicros = 0;
+uint64_t checkChuteTimeMicros = 0;
+uint64_t checkLandedTimeMicros = 0;
 uint64_t logDtMicros = 0;
 double dt = 0;
 
@@ -74,9 +76,9 @@ int homeYAngle = 90;
 int homeZAngle = 90;
 int SGR = 6;
 
-double kp = 0.24;
-double ki = 0.05;
-double kd = 0.07;
+double kp = 0.25;
+double ki = 0.1;
+double kd = 0.1;
 double setpoint = 0;
 PID pidY = {kp, ki, kd, setpoint};
 PID pidZ = {kp, ki, kd, setpoint};
@@ -89,6 +91,7 @@ uint8_t logFileNumber;
 int failure;
 // bool abort;
 
+float startAlt;
 float aproxAlt;
 float aproxFilteredAlt;
 float maxAlt = 0;
@@ -184,6 +187,8 @@ void startup()
                   Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
                   Adafruit_BMP280::FILTER_X16,      /* Filtering. */
                   Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+
+    startAlt = bmp.readAltitude(1022);
 
     baroFIR.FIRFilter_Init();
 }
@@ -333,6 +338,7 @@ void updateTiming()
 void checkBaro()
 {
     curAlt = baroFIR.FIRFilter_Update(bmp.readAltitude(1022));
+    curAlt -= startAlt;
 }
 
 void checkIMU()
@@ -341,8 +347,8 @@ void checkIMU()
     accel.readSensor();
 
     gyroData.roll = gyro.getGyroX_rads();
-    gyroData.pitch = gyro.getGyroY_rads();
-    gyroData.yaw = gyro.getGyroZ_rads();
+    gyroData.pitch = -gyro.getGyroY_rads();
+    gyroData.yaw = -gyro.getGyroZ_rads();
 
     accelData.x = accel.getAccelX_mss();
     accelData.y = accel.getAccelY_mss();
@@ -354,9 +360,6 @@ void checkIMU()
 
     ori.update(gyroData, dt);
     gyroOut = ori.toEuler();
-
-    gyroOut.pitch = gyroOut.pitch; // sign flip because for some reason pitch and yaw are left hand rule naturally
-    gyroOut.yaw = -gyroOut.yaw;
 }
 
 void updatePID()
@@ -364,14 +367,14 @@ void updatePID()
     pidYOut = pidY.update(gyroOut.pitch * RAD_TO_DEG, dt);
     pidZOut = pidZ.update(gyroOut.yaw * RAD_TO_DEG, dt);
 
-    pidYOut = -pidYOut;
-    pidZOut = -pidZOut;
+    pidYOut = pidYOut;
+    pidZOut = pidZOut; // #signflip again because this control system makes no sense
 
     angleYOut = constrain(pidYOut, -5, 6);
-    angleZOut = constrain(pidZOut, -14, 8);
+    angleZOut = constrain(pidZOut, -6, 6);
 
     finalAngleYOut = constrain(((angleYOut * SGR) + homeYAngle) + servoYOffset, 0, 180);
-    finalAngleZOut = constrain(((angleZOut * SGR) + homeZAngle) + servoZOffset, 0, 180);
+    finalAngleZOut = constrain(((-angleZOut * SGR) + homeZAngle) + servoZOffset, 0, 180);
 
     // Serial.print("finalAngleYOut: "); Serial.print(finalAngleYOut); Serial.print("\t");
     // Serial.print("finalAngleZOut: "); Serial.print(finalAngleZOut); Serial.print("\n");
@@ -393,12 +396,28 @@ void checkLaunch()
 }
 */
 
+void checkAbort()
+{
+    if (gyroOut.pitch * RAD_TO_DEG > 45)
+    {
+        currentState = ABORT;
+    } else if (gyroOut.pitch * RAD_TO_DEG < -45)
+    {
+        currentState = ABORT;
+    }
+    if (gyroOut.yaw * RAD_TO_DEG > 45)
+    {
+        currentState = ABORT;
+    } else if (gyroOut.yaw * RAD_TO_DEG < -45)
+    {
+        currentState = ABORT;
+    }
+}
+
 void checkLaunch()
 {
     if(accelData.x > LAUNCH_CHECK)
-    {
         currentState = FLIGHT;
-    }
 }
 
 void checkBurnout() 
@@ -409,31 +428,37 @@ void checkBurnout()
 void checkApogee()
 {
     maxAlt = max(maxAlt, curAlt);
-    if (curAlt > maxAlt - 0.5)
+    if (curAlt > maxAlt - 0.15)
         checkStartTimeMicros = thisLoopMicros;
-    if (thisLoopMicros > (checkStartTimeMicros + 0.5))
+    if (((double)thisLoopMicros / 1000000.) > (((double)checkStartTimeMicros / 1000000.) + 0.25))
         currentState = BALLISTIC_DESCENT;
 }
 
 void checkChuteStop()
 {
-
+    if (curAlt < maxAlt - 0.5) // change this number for actual flight.
+    {
+        digitalWrite(pyro3, HIGH);
+        checkChuteTimeMicros = thisLoopMicros;
+    }
+    if (((double)thisLoopMicros / 1000000.) > (((double)checkChuteTimeMicros / 1000000.) + 1)) // allow time for pyro to fire
+        currentState = CHUTE_DESCENT;
 }
 
 void checkLanded()
 {
-
-}
-
-void showSafe()
-{
-
+    checkLandedTimeMicros = thisLoopMicros;
+    if (((double)thisLoopMicros / 1000000.) > (((double)checkLandedTimeMicros / 1000000.) + 7.5))
+        currentState = GROUND_SAFE;
 }
 
 void landed()
 {
     logFile.flush();
     logFile.close();
+
+    tvcY.write(90 + servoYOffset);
+    tvcZ.write(90 + servoZOffset);
 
     Serial.println("Flight complete");
 
@@ -442,11 +467,15 @@ void landed()
 
 void abortFlight()
 {
-    // if (currentState == ABORT)
-    // {
+    digitalWrite(pyro3, HIGH);
+    delay(500);
+    digitalWrite(pyro3, LOW);
 
-    // }
+    tvcY.write(90 + servoYOffset);
+    tvcZ.write(90 + servoZOffset);
+
     Serial.println("FLIGHT ABORT");
+    while(1) {}
 }
 
 void setup()
@@ -468,35 +497,43 @@ void loop()
     updateTiming();
 
     Serial.print("TIME: "); Serial.print((double)thisLoopMicros / 1000000.); Serial.print("\t");
+    Serial.print("CHUTE: "); Serial.print((double)checkChuteTimeMicros / 1000000.); Serial.print("\t");
 
     checkIMU();
     checkBaro();
 
+    checkAbort();
+
+    Serial.print("GY: "); Serial.print(gyroData.pitch); Serial.print("\t");
+    Serial.print("GZ: "); Serial.print(gyroData.yaw); Serial.print("\t");
     Serial.print("PITCH: "); Serial.print(gyroOut.pitch * RAD_TO_DEG); Serial.print("\t");
     Serial.print("YAW: ");Serial.print(gyroOut.yaw * RAD_TO_DEG); Serial.print("\t");
     Serial.print("PIDY: "); Serial.print(angleYOut); Serial.print("\t");
     Serial.print("PIDZ: ");Serial.print(angleZOut); Serial.print("\t");
     Serial.print("curAlt: "); Serial.print(curAlt); Serial.print("\t");
-    Serial.print("maxAlt: "); Serial.print(maxAlt); Serial.print("\n");
+    Serial.print("maxAlt: "); Serial.print(maxAlt); Serial.print("\t");
+    Serial.print("state: "); Serial.print(currentState); Serial.print("\n");
     
     switch(currentState)
     {
         case GROUND_IDLE:
+            digitalWrite(pyro4, HIGH); // Ignite ascent motor
             checkLaunch();
             break;
         case FLIGHT:
+            digitalWrite(pyro4, LOW); // Turn off ascent motor pyro after launch detection (so I don't drain the lipos)
             updatePID();
             checkApogee();
             break;
-        case BALLISTIC_DESCENT:
-            Serial.print("IT WORKED!!!!!!!!!!!!!!!!!!!!!!!!!!");
+        case BALLISTIC_DESCENT: 
             checkChuteStop();
             break;
         case CHUTE_DESCENT:
+            digitalWrite(pyro3, LOW);
             checkLanded();
             break;
         case GROUND_SAFE:
-            showSafe();
+            landed();
             break;
         case ABORT:
             abortFlight();
