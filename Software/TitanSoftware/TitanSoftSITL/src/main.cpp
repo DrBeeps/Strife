@@ -8,12 +8,15 @@
 
 #include <Orientation.h>
 #include <PID.h>
+#include <SITL.h>
 
 #include <DataPoint.h>
 #include <FlightState.h>
 #include <FIRFilter.h>
 
 
+
+SITL Sim;
 
 Bmi088Accel accel(Wire,0x19);
 Bmi088Gyro gyro(Wire,0x69);
@@ -58,7 +61,7 @@ uint64_t logDtMicros = 0;
 double dt = 0;
 
 uint64_t nextServoMicros = 0;
-const uint8_t servoHz = 40;
+const uint8_t servoHz = 16;
 const uint64_t servoMicros = 1000000 / servoHz;
 
 uint64_t lastLogUpdate = 0;
@@ -76,9 +79,9 @@ int homeYAngle = 90;
 int homeZAngle = 90;
 int SGR = 6;
 
-double kp = 0.6;
-double ki = 0.155;
-double kd = 0.14;
+double kp = 0.25;
+double ki = 0.1;
+double kd = 0.1;
 double setpoint = 0;
 PID pidY = {kp, ki, kd, setpoint};
 PID pidZ = {kp, ki, kd, setpoint};
@@ -108,6 +111,32 @@ double temp;
 int DATA_ERROR;
 
 int test = 1;
+
+
+// Sample Time
+double T_Program = 0.01;
+unsigned long T_Program_micros = T_Program * 1000000;
+unsigned long timer_run;
+
+// PID
+unsigned long currentTime, previousTime;
+double elapsedTime,elapsedTimeSeg;
+double errorPID;
+double lastError;
+double input, output, setPoint;
+double cumError, rateError;
+double okp, oki, okd;
+double out;
+
+// Saturation and Real Actuator
+double Actuator_reduction = 5;
+double Max_Actuator_Angle = 5 * RAD_TO_DEG;
+double Max_servo_Angle = Max_Actuator_Angle * Actuator_reduction;
+
+// SinL
+float theta, servo_command, Alt_prev;
+int parachute = 0;
+float GyroY, AccX, AccZ, Alt;
 
 
 
@@ -154,7 +183,10 @@ void getGyroBias()
 
 void startup()
 {
-    Serial.begin(115200);
+    // Serial.begin(115200);
+    Serial.begin(1000000); // only for SITL (remove for actual flight)
+    Sim.StartSITL(); // also only for SITL
+
     delay(1000);
 
     /* ===== BMI088 INIT ===== */
@@ -362,6 +394,38 @@ void checkIMU()
     gyroOut = ori.toEuler();
 }
 
+
+void checkIMU_SITL()
+{
+    if (micros() >= timer_run + T_Program_micros)
+    {  
+    dt = double(micros() - timer_run);
+    // micros to seconds
+    dt /= 1000000;
+    timer_run = micros();  
+
+    // SinL Simulation
+    Sim.getSimData(GyroY, AccX, AccZ, Alt);
+
+    // Integrate the Gyros to find the angle.
+    theta += (GyroY * RAD_TO_DEG) * dt;
+
+    double setpoint = 10 * DEG2RAD;
+    out = PID(setpoint, theta);
+    servo_command = PID2Servo(out);
+    
+    // Parachute
+    parachute = Deploy_Parachute(Alt);
+
+    // Real servo
+    double servo_center = 90;
+    servo.write(-servo_command + servo_center); 
+    
+    // Simulated servo and parachute
+    Sim.sendCommand(servo_command, parachute); 
+    }
+}
+
 void updatePID()
 {
     pidYOut = pidY.update(gyroOut.pitch * RAD_TO_DEG, dt);
@@ -495,24 +559,35 @@ void setup()
 
     currentState = GROUND_IDLE;
     // getGyroBias();
-    startTiming();
+    // startTiming();
+    Sim.StartSITL();
 }
 
 void loop() 
 {
-    updateTiming();
 
-    
+
+
+
+
+
+
+
+
+
+    // updateTiming();
+
+    /*
     Serial.print("TIME: "); Serial.print((double)thisLoopMicros / 1000000.); Serial.print("\t");
     Serial.print("CHUTE: "); Serial.print((double)checkChuteTimeMicros / 1000000.); Serial.print("\t");
-    
+    */
 
-    checkIMU();
-    checkBaro();
+    // checkIMU();
+    // checkBaro();
 
     // checkAbort();
 
-    
+    /*
     Serial.print("GY: "); Serial.print(gyroData.pitch); Serial.print("\t");
     Serial.print("GZ: "); Serial.print(gyroData.yaw); Serial.print("\t");
     Serial.print("PITCH: "); Serial.print(gyroOut.pitch * RAD_TO_DEG); Serial.print("\t");
@@ -522,8 +597,9 @@ void loop()
     Serial.print("curAlt: "); Serial.print(curAlt); Serial.print("\t");
     Serial.print("maxAlt: "); Serial.print(maxAlt); Serial.print("\t");
     Serial.print("state: "); Serial.print(currentState); Serial.print("\n");
-    
-    
+    */
+
+    /*
     switch(currentState)
     {
         case GROUND_IDLE:
@@ -555,7 +631,8 @@ void loop()
         case STATIC_FIRE:
             break;
     }
+    */
     
 
-    logData();
+    // logData();
 }
